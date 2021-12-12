@@ -1,0 +1,815 @@
+#!/bin/bash
+
+#####################################################################################
+# the main output dir, all configure and make output are in this dir.
+#####################################################################################
+# create the main objs
+SRS_WORKDIR="."
+SRS_OBJS_DIR="objs"
+SRS_OBJS="${SRS_WORKDIR}/${SRS_OBJS_DIR}"
+SRS_MAKEFILE="Makefile"
+
+# linux shell color support.
+RED="\\033[31m"
+GREEN="\\033[32m"
+YELLOW="\\033[33m"
+BLACK="\\033[0m"
+
+#####################################################################################
+# parse user options, set the variables like:
+# srs features: SRS_SSL/SRS_HLS/SRS_HTTP_CALLBACK/......
+# build options: SRS_JOBS
+#####################################################################################
+# parse options, exit with error when parse options invalid.
+. auto/options.sh
+
+# setup variables when options parsed.
+. auto/setup_variables.sh
+
+# We don't need to cleanup the exists files.
+rm -f ${SRS_WORKDIR}/${SRS_MAKEFILE}
+
+# create objs
+mkdir -p ${SRS_OBJS}/${SRS_PLATFORM}
+
+# apply user options.
+. auto/depends.sh
+
+# the auto generated variables.
+. auto/auto_headers.sh
+
+#####################################################################################
+# generate Makefile.
+#####################################################################################
+# ubuntu echo in Makefile cannot display color, use bash instead
+SRS_BUILD_SUMMARY="_srs_build_summary.sh"
+
+# utest make entry, (cd utest; make)
+SrsUtestMakeEntry="@echo -e \"ignore utest for it's disabled\""
+if [ $SRS_UTEST = YES ]; then SrsUtestMakeEntry="(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM}/utest && \$(MAKE))"; fi
+
+#####################################################################################
+# finger out modules to install.
+# where srs module is a dir which contains a config file.
+SRS_MODULES=()
+__mfiles=`find modules -name "config"` && for __mfile in $__mfiles; do
+    SRS_MODULES+=("`dirname $__mfile`")
+done
+
+# variables for makefile for all modules.
+__mphonys="" && __mdefaults="" && __mcleanups="" && __makefiles=""
+# add each modules for application
+for SRS_MODULE in ${SRS_MODULES[*]}; do
+    echo "install module at: $SRS_MODULE"
+    . $SRS_MODULE/config
+    if [[ $SRS_MODULE_MAKEFILE != "" ]]; then
+        __makefiles="$__makefiles $SRS_MODULE_MAKEFILE"
+    fi
+    if [[ 0 -ne ${#SRS_MODULE_MAIN[@]} ]]; then
+        __mphonys="$__mphonys $SRS_MODULE_NAME"
+        __mdefaults="$__mdefaults $SRS_MODULE_NAME"
+        __mcleanups="$__mcleanups $SRS_MODULE_NAME"
+    fi
+done
+
+# generate extra phony for each modules.
+cat << END > ${SRS_OBJS}/${SRS_MAKEFILE}
+
+.PHONY: $__mphonys
+
+END
+
+#####################################################################################
+# build tools or compiler args.
+# enable gdb debug
+GDBDebug=" -g -O0"
+# the warning level.
+WarnLevel=" -Wall -Wno-deprecated-declarations"
+# the compile standard.
+CppStd="-ansi"
+if [[ $SRS_CXX11 == YES ]]; then
+    CppStd="-std=c++11"
+fi
+if [[ $SRS_CXX14 == YES ]]; then
+    CppStd="-std=c++14"
+fi
+# performance of gprof
+SrsGprof=""; SrsGprofLink=""; if [ $SRS_GPROF = YES ]; then SrsGprof=" -pg -lc_p"; SrsGprofLink=" -pg"; fi
+# performance of gperf
+SrsGperf=""; SrsGperfLink=""; if [ $SRS_GPERF = YES ]; then SrsGperfLink=" -lpthread"; fi
+# the cxx flag generated.
+CXXFLAGS="${CXXFLAGS} ${CppStd}${WarnLevel}${GDBDebug}${LibraryCompile}${SrsGprof}"
+if [ $SRS_GPERF = YES ]; then
+    CXXFLAGS="${CXXFLAGS} -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-realloc -fno-builtin-free";
+fi
+# For coverage.
+if [[ $SRS_GCOV == YES ]]; then
+    SrsGcov="-fprofile-arcs -ftest-coverage"
+fi
+if [[ $SRS_GCOV == YES ]]; then
+    CXXFLAGS="${CXXFLAGS} ${SrsGcov}";
+fi
+# User configed options.
+if [[ $SRS_EXTRA_FLAGS != '' ]]; then
+    CXXFLAGS="${CXXFLAGS} $SRS_EXTRA_FLAGS";
+fi
+# Start to generate the Makefile.
+cat << END >> ${SRS_OBJS}/${SRS_MAKEFILE}
+GCC = ${SRS_TOOL_CC}
+CXX = ${SRS_TOOL_CXX}
+AR = ${SRS_TOOL_AR}
+LINK = ${SRS_TOOL_CXX}
+CXXFLAGS = ${CXXFLAGS}
+
+.PHONY: default srs srs_ingest_hls
+
+default:
+
+END
+
+#####################################################################################
+# Libraries, external library to build in srs,
+# header(.h): add to ModuleLibIncs if need the specified library. for example, LibSTRoot
+# library(.a): add to ModuleLibFiles if binary need the specifeid library. for example, LibSTfile
+#
+# st(state-threads) the basic network library for SRS.
+LibSTRoot="${SRS_OBJS_DIR}/st"; LibSTfile="${LibSTRoot}/libst.a"
+if [[ $SRS_SHARED_ST == YES ]]; then LibSTfile="-L${LibSTRoot} -lst"; fi
+
+# srtp
+if [[ $SRS_RTC == YES ]]; then
+  LibSrtpRoot="${SRS_OBJS_DIR}/srtp2/include"; LibSrtpFile="${SRS_OBJS_DIR}/srtp2/lib/libsrtp2.a"
+fi
+
+# FFMPEG for WebRTC transcoding, such as aac to opus.
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+  LibFfmpegRoot="${SRS_OBJS_DIR}/ffmpeg/include"; LibFfmpegFile="${SRS_OBJS_DIR}/ffmpeg/lib/libavcodec.a ${SRS_OBJS_DIR}/ffmpeg/lib/libswresample.a ${SRS_OBJS_DIR}/ffmpeg/lib/libavutil.a"
+  if [[ $SRS_CROSS_BUILD == NO ]]; then
+    LibFfmpegRoot="${LibFfmpegRoot} ${SRS_OBJS_DIR}/opus/include"; LibFfmpegFile="${LibFfmpegFile} ${SRS_OBJS_DIR}/opus/lib/libopus.a"
+  fi
+  if [[ $SRS_SHARED_FFMPEG == YES ]]; then LibFfmpegFile="-L${SRS_OBJS_DIR}/ffmpeg/lib -lavcodec -lswresample -lavutil -L${SRS_OBJS_DIR}/opus/lib -lopus"; fi
+fi
+
+# openssl-1.1.0e, for the RTMP complex handshake.
+LibSSLRoot="";LibSSLfile=""
+if [[ $SRS_SSL == YES && $SRS_USE_SYS_SSL == NO ]]; then
+    LibSSLRoot="${SRS_OBJS_DIR}/openssl/include"; LibSSLfile="${SRS_OBJS_DIR}/openssl/lib/libssl.a ${SRS_OBJS_DIR}/openssl/lib/libcrypto.a";
+fi
+
+# gperftools-2.1, for mem check and mem/cpu profile
+LibGperfRoot=""; LibGperfFile=""
+if [ $SRS_GPERF = YES ]; then
+    LibGperfRoot="${SRS_OBJS_DIR}/gperf/include"; LibGperfFile="${SRS_OBJS_DIR}/gperf/lib/libtcmalloc_and_profiler.a";
+fi
+if [ $SRS_GPERF_MD = YES ]; then
+    LibGperfFile="${SRS_OBJS_DIR}/gperf/lib/libtcmalloc_debug.a";
+fi
+
+# srt code path
+if [[ $SRS_SRT == YES ]]; then
+    SrsSRTRoot="${SRS_WORKDIR}/src/srt"
+    LibSRTRoot="${SRS_OBJS_DIR}/srt/include"; LibSRTfile="${SRS_OBJS_DIR}/srt/lib/libsrt.a"
+    if [[ $SRS_SHARED_SRT == YES ]]; then LibSRTfile="-L${SRS_OBJS_DIR}/srt/lib -lsrt"; fi
+fi
+
+# the link options, always use static link
+SrsLinkOptions="-ldl -lpthread";
+if [[ $SRS_SSL == YES && $SRS_USE_SYS_SSL == YES ]]; then
+    SrsLinkOptions="${SrsLinkOptions} -lssl -lcrypto";
+fi
+
+# Static link the c++ libraries, for user who build SRS by a new version of gcc,
+# so we need to link the c++ libraries staticly but not all.
+# @see https://stackoverflow.com/a/26107550
+if [ $SRS_STATIC = YES ]; then
+    SrsLinkOptions="${SrsLinkOptions} -static-libstdc++";
+fi
+
+# For coverage.
+if [[ $SRS_GCOV == YES ]]; then
+    SrsLinkOptions="${SrsLinkOptions} ${SrsGcov}";
+fi
+
+# For FFMPEG/RTC on Linux.
+if [[ $SRS_OSX != YES && $SRS_RTC == YES && $SRS_FFMPEG_FIT == YES ]]; then
+    SrsLinkOptions="${SrsLinkOptions} -lrt";
+fi
+
+#####################################################################################
+# Modules, compile each module, then link to binary
+#
+#Core, depends only on system apis.
+MODULE_ID="CORE"
+MODULE_DEPENDS=()
+ModuleLibIncs=(${SRS_OBJS_DIR})
+MODULE_FILES=("srs_core" "srs_core_version4" "srs_core_autofree" "srs_core_performance"
+		"srs_core_time")
+CORE_INCS="src/core"; MODULE_DIR=${CORE_INCS} . auto/modules.sh
+CORE_OBJS="${MODULE_OBJS[@]}"
+#
+#Kernel, depends on core, provides error/log/config, nothing about stream information.
+MODULE_ID="KERNEL" 
+MODULE_DEPENDS=("CORE") 
+ModuleLibIncs=(${SRS_OBJS_DIR} ${LibSSLRoot})
+MODULE_FILES=("srs_kernel_error" "srs_kernel_log" "srs_kernel_buffer"
+        "srs_kernel_utility" "srs_kernel_flv" "srs_kernel_codec" "srs_kernel_io"
+        "srs_kernel_consts" "srs_kernel_aac" "srs_kernel_mp3" "srs_kernel_ts"
+        "srs_kernel_stream" "srs_kernel_balance" "srs_kernel_mp4" "srs_kernel_file"
+        "srs_kernel_kbps")
+if [[ $SRS_RTC == YES ]]; then
+    MODULE_FILES+=("srs_kernel_rtc_rtp" "srs_kernel_rtc_rtcp")
+fi
+KERNEL_INCS="src/kernel"; MODULE_DIR=${KERNEL_INCS} . auto/modules.sh
+KERNEL_OBJS="${MODULE_OBJS[@]}"
+#
+#RTMP/HTTP/Raw Protocol, depends on core/kernel, provides rtmp/htttp protocol features.
+MODULE_ID="PROTOCOL" 
+MODULE_DEPENDS=("CORE" "KERNEL") 
+ModuleLibIncs=(${SRS_OBJS_DIR} ${LibSTRoot} ${LibSSLRoot})
+MODULE_FILES=("srs_protocol_amf0" "srs_protocol_io" "srs_rtmp_stack"
+        "srs_rtmp_handshake" "srs_protocol_utility" "srs_rtmp_msg_array" "srs_protocol_stream"
+        "srs_raw_avc" "srs_rtsp_stack" "srs_http_stack" "srs_protocol_kbps" "srs_protocol_json"
+        "srs_protocol_format" "srs_service_log" "srs_service_st" "srs_service_http_client" "srs_service_http_conn"
+        "srs_service_rtmp_conn" "srs_service_utility" "srs_service_conn")
+if [[ $SRS_RTC == YES ]]; then
+    MODULE_FILES+=("srs_rtc_stun_stack")
+    ModuleLibIncs+=(${LibSrtpRoot})
+fi
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+    ModuleLibIncs+=("${LibFfmpegRoot[*]}")
+fi
+PROTOCOL_INCS="src/protocol"; MODULE_DIR=${PROTOCOL_INCS} . auto/modules.sh
+PROTOCOL_OBJS="${MODULE_OBJS[@]}"
+#
+#srt protocol features.
+if [[ $SRS_SRT == YES ]]; then
+    MODULE_ID="SRT"
+    MODULE_DEPENDS=("CORE" "KERNEL" "PROTOCOL" "APP")
+    ModuleLibIncs=(${SRS_OBJS_DIR} ${LibSSLRoot} ${LibSRTRoot})
+    MODULE_FILES=("srt_server" "srt_handle" "srt_conn" "srt_to_rtmp" "ts_demux" "srt_data" "srt_log")
+    SRT_INCS=(${LibSRTRoot} ${SrsSRTRoot}); MODULE_DIR=${SrsSRTRoot} . auto/modules.sh
+    SRT_OBJS="${MODULE_OBJS[@]}"
+fi
+
+#
+#App Module, for SRS server only.
+MODULE_ID="APP"
+MODULE_DEPENDS=("CORE" "KERNEL" "PROTOCOL")
+ModuleLibIncs=(${SRS_OBJS_DIR} ${LibSTRoot} ${LibSSLRoot})
+if [ $SRS_GPERF = YES ]; then
+    ModuleLibIncs+=(${LibGperfRoot})
+fi
+if [[ $SRS_RTC == YES ]]; then
+    ModuleLibIncs+=(${LibSrtpRoot})
+fi
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+    ModuleLibIncs+=("${LibFfmpegRoot[*]}")
+fi
+MODULE_FILES=("srs_app_server" "srs_app_conn" "srs_app_rtmp_conn" "srs_app_source"
+        "srs_app_refer" "srs_app_hls" "srs_app_forward" "srs_app_encoder" "srs_app_http_stream"
+        "srs_app_bandwidth" "srs_app_st" "srs_app_log" "srs_app_config"
+        "srs_app_pithy_print" "srs_app_reload" "srs_app_http_api" "srs_app_http_conn" "srs_app_http_hooks"
+        "srs_app_ingest" "srs_app_ffmpeg" "srs_app_utility" "srs_app_edge"
+        "srs_app_heartbeat" "srs_app_empty" "srs_app_http_client" "srs_app_http_static"
+        "srs_app_recv_thread" "srs_app_security" "srs_app_statistic" "srs_app_hds"
+        "srs_app_mpegts_udp" "srs_app_listener" "srs_app_async_call"
+        "srs_app_caster_flv" "srs_app_latest_version" "srs_app_uuid" "srs_app_process" "srs_app_ng_exec"
+        "srs_app_hourglass" "srs_app_dash" "srs_app_fragment" "srs_app_dvr"
+        "srs_app_coworkers" "srs_app_hybrid" "srs_app_threads")
+if [[ $SRS_RTC == YES ]]; then
+    MODULE_FILES+=("srs_app_rtc_conn" "srs_app_rtc_dtls" "srs_app_rtc_sdp"
+        "srs_app_rtc_queue" "srs_app_rtc_server" "srs_app_rtc_source" "srs_app_rtc_api")
+fi
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+    MODULE_FILES+=("srs_app_rtc_codec")
+fi
+
+DEFINES=""
+# add each modules for app
+for SRS_MODULE in ${SRS_MODULES[*]}; do
+    . $SRS_MODULE/config
+    MODULE_FILES+=("${SRS_MODULE_APP[*]}")
+    DEFINES="${DEFINES} ${SRS_MODULE_DEFINES}"
+done
+APP_INCS="src/app"; MODULE_DIR=${APP_INCS} . auto/modules.sh
+APP_OBJS="${MODULE_OBJS[@]}"
+#
+#Server Module, for SRS only.
+MODULE_ID="SERVER"
+MODULE_DEPENDS=("CORE" "KERNEL" "PROTOCOL" "APP")
+if [[ $SRS_SRT == YES ]]; then
+    MODULE_DEPENDS+=("SRT")
+fi
+ModuleLibIncs=(${SRS_OBJS_DIR} ${LibSTRoot} ${LibGperfRoot} ${LibSSLRoot})
+if [[ $SRS_RTC == YES ]]; then
+    ModuleLibIncs+=(${LibSrtpRoot})
+fi
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+    ModuleLibIncs+=("${LibFfmpegRoot[*]}")
+fi
+if [[ $SRS_SRT == YES ]]; then
+    ModuleLibIncs+=(${LibSRTRoot})
+    ModuleLibIncs+=("${SrsSRTRoot[*]}")
+fi
+MODULE_FILES=("srs_main_server")
+SERVER_INCS="src/main"; MODULE_DIR=${SERVER_INCS} . auto/modules.sh
+SERVER_OBJS="${MODULE_OBJS[@]}"
+#
+#Main Module, for app from modules.
+MODULE_ID="MAIN"
+MODULE_DEPENDS=("CORE" "KERNEL" "PROTOCOL")
+ModuleLibIncs=(${SRS_OBJS_DIR} ${LibSTRoot} ${LibGperfRoot} ${LibSSLRoot})
+if [[ $SRS_RTC == YES ]]; then
+    ModuleLibIncs+=(${LibSrtpRoot})
+fi
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+    ModuleLibIncs+=("${LibFfmpegRoot[*]}")
+fi
+if [[ $SRS_SRT == YES ]]; then
+    ModuleLibIncs+=(${LibSRTRoot})
+    ModuleLibIncs+=("${SrsSRTRoot[*]}")
+fi
+MODULE_FILES=()
+DEFINES=""
+# add each modules for main
+for SRS_MODULE in ${SRS_MODULES[*]}; do
+    . $SRS_MODULE/config
+    MODULE_FILES+=("${SRS_MODULE_MAIN[*]}")
+    DEFINES="${DEFINES} ${SRS_MODULE_DEFINES}"
+done
+MAIN_INCS="src/main"; MODULE_DIR=${MAIN_INCS} . auto/modules.sh
+MAIN_OBJS="${MODULE_OBJS[@]}"
+
+#####################################################################################
+# Binaries, main entrances, link the module and its depends modules,
+# then link to a binary, for example, objs/srs
+#
+# all main entrances
+MAIN_ENTRANCES=("srs_main_server")
+for SRS_MODULE in ${SRS_MODULES[*]}; do
+    . $SRS_MODULE/config
+    MAIN_ENTRANCES+=("${SRS_MODULE_MAIN[*]}")
+done
+#
+# all depends libraries
+ModuleLibFiles=(${LibSTfile} ${LibSSLfile} ${LibGperfFile})
+if [[ $SRS_RTC == YES ]]; then
+    ModuleLibFiles+=(${LibSrtpFile})
+fi
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+    ModuleLibFiles+=("${LibFfmpegFile[*]}")
+fi
+if [[ $SRS_SRT == YES ]]; then
+    ModuleLibFiles+=("${LibSRTfile[*]}")
+fi
+# all depends objects
+MODULE_OBJS="${CORE_OBJS[@]} ${KERNEL_OBJS[@]} ${PROTOCOL_OBJS[@]} ${APP_OBJS[@]} ${SERVER_OBJS[@]}"
+ModuleLibIncs=(${SRS_OBJS_DIR} ${LibSTRoot} ${LibGperfRoot} ${LibSSLRoot})
+if [[ $SRS_RTC == YES ]]; then
+    ModuleLibIncs+=(${LibSrtpRoot})
+fi
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+    ModuleLibIncs+=("${LibFfmpegRoot[*]}")
+fi
+if [[ $SRS_SRT == YES ]]; then
+    ModuleLibIncs+=(${LibSRTRoot})
+    ModuleLibIncs+=("${SrsSRTRoot[*]}")
+    MODULE_OBJS="${MODULE_OBJS} ${SRT_OBJS[@]}"
+fi
+LINK_OPTIONS="${SrsLinkOptions}${SrsGprofLink}${SrsGperfLink}"
+#
+# srs: srs(simple rtmp server) over st(state-threads)
+BUILD_KEY="srs" APP_MAIN="srs_main_server" APP_NAME="srs" . auto/apps.sh
+#
+# For modules, without the app module.
+MODULE_OBJS="${CORE_OBJS[@]} ${KERNEL_OBJS[@]} ${PROTOCOL_OBJS[@]} ${MAIN_OBJS[@]}"
+ModuleLibFiles=(${LibSTfile} ${LibSSLfile} ${LibGperfFile})
+if [[ $SRS_RTC == YES ]]; then
+    ModuleLibFiles+=(${LibSrtpFile})
+fi
+if [[ $SRS_FFMPEG_FIT == YES ]]; then
+    ModuleLibFiles+=("${LibFfmpegFile[*]}")
+fi
+#
+for SRS_MODULE in ${SRS_MODULES[*]}; do
+    . $SRS_MODULE/config
+    # no SRS_MODULE_MAIN
+    if [[ 0 -eq ${#SRS_MODULE_MAIN[@]} ]]; then continue; fi
+    BUILD_KEY="$SRS_MODULE_NAME" APP_MAIN="${SRS_MODULE_MAIN[0]}" APP_NAME="$SRS_MODULE_NAME" . auto/apps.sh
+done
+# For utest on mac.
+# @see https://github.com/protocolbuffers/protobuf/issues/51#issuecomment-111044468
+if [[ $SRS_OSX == YES ]]; then
+    UTEST_EXTRA_DEFINES="-DGTEST_USE_OWN_TR1_TUPLE=1"
+fi
+#
+# utest, the unit-test cases of srs, base on gtest1.6
+if [ $SRS_UTEST = YES ]; then
+    MODULE_FILES=("srs_utest" "srs_utest_amf0" "srs_utest_protocol" "srs_utest_kernel" "srs_utest_core"
+        "srs_utest_config" "srs_utest_rtmp" "srs_utest_http" "srs_utest_avc" "srs_utest_reload"
+        "srs_utest_mp4" "srs_utest_service" "srs_utest_app" "srs_utest_rtc")
+    ModuleLibIncs=(${SRS_OBJS_DIR} ${LibSTRoot} ${LibSSLRoot})
+    if [[ $SRS_RTC == YES ]]; then
+        ModuleLibIncs+=(${LibSrtpRoot})
+    fi
+    if [[ $SRS_FFMPEG_FIT == YES ]]; then
+        ModuleLibIncs+=("${LibFfmpegRoot[*]}")
+    fi
+    if [[ $SRS_SRT == YES ]]; then
+        ModuleLibIncs+=("${SrsSRTRoot[*]}")
+    fi
+    ModuleLibFiles=(${LibSTfile} ${LibSSLfile})
+    if [[ $SRS_RTC == YES ]]; then
+        ModuleLibFiles+=(${LibSrtpFile})
+    fi
+    if [[ $SRS_FFMPEG_FIT == YES ]]; then
+        ModuleLibFiles+=("${LibFfmpegFile[*]}")
+    fi
+    if [[ $SRS_SRT == YES ]]; then
+        ModuleLibFiles+=("${LibSRTfile[*]}")
+    fi
+    MODULE_DEPENDS=("CORE" "KERNEL" "PROTOCOL" "APP")
+    if [[ $SRS_SRT == YES ]]; then
+        MODULE_DEPENDS+=("SRT")
+    fi
+    MODULE_OBJS="${CORE_OBJS[@]} ${KERNEL_OBJS[@]} ${PROTOCOL_OBJS[@]} ${APP_OBJS[@]} ${SRT_OBJS[@]}"
+    LINK_OPTIONS="-lpthread ${SrsLinkOptions}" MODULE_DIR="src/utest" APP_NAME="srs_utest" . auto/utest.sh
+fi
+
+#####################################################################################
+# generate colorful summary script
+. auto/summary.sh
+
+#####################################################################################
+# makefile
+echo "Generate Makefile"
+
+# backup old makefile.
+rm -f ${SRS_WORKDIR}/${SRS_MAKEFILE}.bk &&
+mv ${SRS_WORKDIR}/${SRS_MAKEFILE} ${SRS_WORKDIR}/${SRS_MAKEFILE}.bk
+
+# generate phony header
+cat << END > ${SRS_WORKDIR}/${SRS_MAKEFILE}
+.PHONY: default _default install help clean destroy server srs_ingest_hls utest _prepare_dir $__mphonys
+.PHONY: clean_srs clean_modules clean_openssl clean_nginx clean_cherrypy clean_srtp2 clean_opus clean_ffmpeg clean_st
+.PHONY: st ffmpeg
+
+GCC = ${SRS_TOOL_CC}
+CXX = ${SRS_TOOL_CXX}
+AR = ${SRS_TOOL_AR}
+LINK = ${SRS_TOOL_LD}
+RANDLIB = ${SRS_TOOL_RANDLIB}
+CXXFLAGS = ${CXXFLAGS}
+
+# install prefix.
+SRS_PREFIX=${SRS_PREFIX}
+__REAL_INSTALL=\$(DESTDIR)\$(SRS_PREFIX)
+
+default:
+	\$(MAKE) _default
+
+END
+
+# the real entry for all platform:
+cat << END >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+_default: server srs_ingest_hls utest __modules $__mdefaults
+	@bash objs/_srs_build_summary.sh
+
+help:
+	@echo "Usage: make <help>|<clean>|<destroy>|<server>|<utest>|<install>|<uninstall>"
+	@echo "     help            Display this help menu"
+	@echo "     clean           Cleanup project and all depends"
+	@echo "     destroy         Cleanup all files for this platform in ${SRS_OBJS_DIR}/${SRS_PLATFORM}"
+	@echo "     server          Build the srs and other modules in main"
+	@echo "     utest           Build the utest for srs"
+	@echo "     install         Install srs to the prefix path"
+	@echo "     uninstall       Uninstall srs from prefix path"
+	@echo "To rebuild special module:"
+	@echo "     st              Rebuild st-srs in ${SRS_OBJS_DIR}/${SRS_PLATFORM}/st-srs"
+	@echo "     ffmpeg          Rebuild ffmpeg in ${SRS_OBJS}/${SRS_PLATFORM}/ffmpeg-4.2-fit"
+	@echo "To reconfigure special depends:"
+	@echo "     clean_openssl   Remove the openssl cache."
+	@echo "     clean_srtp2     Remove the libsrtp2 cache."
+	@echo "     clean_opus      Remove the opus cache."
+	@echo "     clean_ffmpeg    Remove the FFmpeg cache."
+	@echo "     clean_st        Remove the ST cache."
+	@echo "For example:"
+	@echo "     make"
+	@echo "     make help"
+
+doclean:
+	(cd ${SRS_OBJS_DIR} && rm -rf srs srs_utest $__mcleanups)
+	(cd ${SRS_OBJS_DIR} && rm -rf src/* include lib)
+	(mkdir -p ${SRS_OBJS_DIR}/utest && cd ${SRS_OBJS_DIR}/utest && rm -rf *.o *.a)
+	(cd research/api-server/static-dir && rm -rf crossdomain.xml forward live players)
+
+clean: clean_srs clean_modules
+
+destroy:
+	(cd ${SRS_OBJS_DIR} && rm -rf ${SRS_PLATFORM})
+
+clean_srs:
+	@(cd ${SRS_OBJS_DIR} && rm -rf srs srs_utest)
+	@(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM} && rm -rf include/* lib/*)
+	@(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM} && find src -name "*.o" -delete)
+	@(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM} && find utest -name "*.o" -delete)
+
+clean_modules:
+	@(cd ${SRS_OBJS_DIR} && rm -rf $__mdefaults)
+
+clean_openssl:
+	(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM} && rm -rf openssl*)
+	@echo "Please rebuild openssl by: ./configure"
+
+clean_srtp2:
+	(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM} && rm -rf libsrtp-2.0.0)
+	@echo "Please rebuild libsrtp2 by: ./configure"
+
+clean_opus:
+	(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM} && rm -rf opus-1.3.1)
+	@echo "Please rebuild opus by: ./configure"
+
+clean_ffmpeg:
+	(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM} && rm -rf ffmpeg-4.2-fit)
+	@echo "Please rebuild FFmpeg by: ./configure"
+
+clean_st:
+	(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM} && rm -rf st-srs)
+	@echo "Please rebuild ST by: ./configure"
+
+clean_nginx:
+	(cd ${SRS_OBJS_DIR} && rm -rf nginx)
+
+clean_cherrypy:
+	(cd research/api-server/static-dir && rm -rf crossdomain.xml forward live players)
+
+st:
+	(cd ${SRS_OBJS_DIR} && rm -f srs srs_utest)
+	(cd ${SRS_OBJS_DIR}/${SRS_PLATFORM}/st-srs && \$(MAKE) clean && \$(MAKE) ${_ST_MAKE} EXTRA_CFLAGS="${_ST_EXTRA_CFLAGS}" CC=\$(GCC) AR=\$(AR) LD=\$(LINK) RANDLIB=\$(RANDLIB))
+	@echo "Please rebuild srs by: rm -f objs/srs && make"
+
+ffmpeg:
+	(cd ${SRS_OBJS_DIR} && rm -f srs srs_utest)
+	(cd ${SRS_OBJS}/${SRS_PLATFORM}/ffmpeg-4.2-fit && \$(MAKE) && \$(MAKE) install-libs)
+	@echo "Please rebuild srs by: rm -f objs/srs && make"
+
+END
+
+# for Makefile of all modules.
+# depends on server, for some modules maybe use srs files.
+echo "__modules: server" >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+for MMF in ${__makefiles[*]}; do
+    echo "	\$(MAKE) -f $MMF" >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+done
+echo "" >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+
+cat << END >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+server: _prepare_dir
+	@echo "Build the SRS server"
+	\$(MAKE) -f ${SRS_OBJS_DIR}/${SRS_MAKEFILE} srs
+
+END
+# generate all modules entry
+for SRS_MODULE in ${SRS_MODULES[*]}; do
+    . $SRS_MODULE/config
+    cat << END >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+$SRS_MODULE_NAME: _prepare_dir server
+	@echo "Build the $SRS_MODULE_NAME over SRS"
+	\$(MAKE) -f ${SRS_OBJS_DIR}/${SRS_MAKEFILE} $SRS_MODULE_NAME
+
+END
+done
+
+# install entry
+cat << END >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+uninstall:
+	@echo "rmdir \$(SRS_PREFIX)"
+	@rm -rf \$(SRS_PREFIX)
+
+install:
+	@echo "Now mkdir \$(__REAL_INSTALL)"
+	@mkdir -p \$(__REAL_INSTALL)
+	@echo "Now make the http root dir"
+	@mkdir -p \$(__REAL_INSTALL)/objs/nginx/html
+	@cp -f research/api-server/static-dir/index.html \$(__REAL_INSTALL)/objs/nginx/html
+	@cp -f research/players/crossdomain.xml \$(__REAL_INSTALL)/objs/nginx/html
+	@cp -f research/api-server/static-dir/favicon.ico \$(__REAL_INSTALL)/objs/nginx/html
+	@cp -Rf research/players \$(__REAL_INSTALL)/objs/nginx/html/
+	@cp -Rf research/console \$(__REAL_INSTALL)/objs/nginx/html/
+	@cp -Rf 3rdparty/signaling/www/demos \$(__REAL_INSTALL)/objs/nginx/html/
+	@echo "Now copy binary files"
+	@mkdir -p \$(__REAL_INSTALL)/objs
+	@cp -f objs/srs \$(__REAL_INSTALL)/objs
+	@echo "Now copy srs conf files"
+	@mkdir -p \$(__REAL_INSTALL)/conf
+	@cp -f conf/*.conf \$(__REAL_INSTALL)/conf
+	@echo "Now copy init.d script files"
+	@mkdir -p \$(__REAL_INSTALL)/etc/init.d
+	@cp -f etc/init.d/srs \$(__REAL_INSTALL)/etc/init.d
+	@sed -i "s|^ROOT=.*|ROOT=\"\$(SRS_PREFIX)\"|g" \$(__REAL_INSTALL)/etc/init.d/srs
+	@echo "Now copy systemctl service files"
+	@mkdir -p \$(__REAL_INSTALL)/usr/lib/systemd/system
+	@cp -f usr/lib/systemd/system/srs.service \$(__REAL_INSTALL)/usr/lib/systemd/system/srs.service
+	@echo ""
+	@echo "The api installed, to link and start srs, please"
+	@echo "For CentOS6:"
+	@echo "     sudo ln -sf \$(SRS_PREFIX)/etc/init.d/srs /etc/init.d/srs &&"
+	@echo "     /etc/init.d/srs start"
+	@echo "For CentOS7:"
+	@echo "     sudo ln -sf \$(SRS_PREFIX)/etc/init.d/srs /etc/init.d/srs &&"
+	@echo "     sudo cp -f \$(SRS_PREFIX)/usr/lib/systemd/system/srs.service /usr/lib/systemd/system/srs.service && sudo systemctl daemon-reload && sudo systemctl enable srs &&"
+	@echo "     sudo systemctl start srs"
+	@echo "@see: https://github.com/ossrs/srs/wiki/v3_CN_LinuxService"
+
+END
+
+if [ $SRS_UTEST = YES ]; then
+    cat << END >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+utest: server
+	@echo "Building the utest for srs"
+	${SrsUtestMakeEntry}
+	@echo "The utest is built ok."
+
+END
+else
+    cat << END >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+utest: server
+	@echo "Ignore utest for it's disabled."
+
+END
+fi
+
+cat << END >> ${SRS_WORKDIR}/${SRS_MAKEFILE}
+# the ./configure will generate it.
+_prepare_dir:
+	@mkdir -p ${SRS_OBJS_DIR}
+END
+
+# generate makefile ok, append the tails.
+cat ${SRS_WORKDIR}/${SRS_MAKEFILE}.bk >> ${SRS_WORKDIR}/${SRS_MAKEFILE} &&
+rm -f ${SRS_WORKDIR}/${SRS_MAKEFILE}.bk
+
+echo 'Configure ok! '
+
+#####################################################################################
+# when configure success, prepare build
+#####################################################################################
+# create objs/logs for ffmpeg to write log.
+mkdir -p ${SRS_OBJS}/logs
+
+#####################################################################################
+# configure summary
+#####################################################################################
+# summary
+echo ""
+echo "Configure summary:"
+echo "     ${SRS_AUTO_USER_CONFIGURE}"
+echo "     ${SRS_AUTO_CONFIGURE}"
+if [ $SRS_HLS = YES ]; then
+    echo -e "${GREEN}HLS is enabled.${BLACK}"
+else
+    echo -e "${YELLOW}Warning: HLS is disabled.${BLACK}"
+fi
+if [ $SRS_STREAM_CASTER = YES ]; then
+    echo -e "${YELLOW}Experiment: StreamCaster is enabled.${BLACK}"
+else
+    echo -e "${GREEN}Note: StreamCaster is disabled.${BLACK}"
+fi
+if [ $SRS_HDS = YES ]; then
+    echo -e "${YELLOW}Experiment: HDS is enabled.${BLACK}"
+else
+    echo -e "${GREEN}Warning: HDS is disabled.${BLACK}"
+fi
+if [ $SRS_SRT = YES ]; then
+    echo -e "${YELLOW}Experiment: SRT is enabled. https://github.com/ossrs/srs/issues/1147${BLACK}"
+else
+    echo -e "${GREEN}Warning: SRT is disabled.${BLACK}"
+fi
+if [ $SRS_RTC = YES ]; then
+    echo -e "${YELLOW}Experiment: RTC is enabled. https://github.com/ossrs/srs/issues/307${BLACK}"
+else
+    echo -e "${GREEN}Warning: RTC is disabled.${BLACK}"
+fi
+if [ $SRS_HTTPS = YES ]; then
+    echo -e "${YELLOW}Experiment: HTTPS is enabled. https://github.com/ossrs/srs/issues/1657${BLACK}"
+else
+    echo -e "${GREEN}Warning: HTTPS is disabled.${BLACK}"
+fi
+if [ $SRS_DVR = YES ]; then
+    echo -e "${GREEN}DVR is enabled.${BLACK}"
+else
+    echo -e "${YELLOW}Warning: DVR is disabled.${BLACK}"
+fi
+if [ $SRS_SSL = YES ]; then
+    echo -e "${GREEN}RTMP complex handshake is enabled${BLACK}"
+else
+    echo -e "${YELLOW}Warning: RTMP complex handshake is disabled, flash cann't play h264/aac.${BLACK}"
+fi
+if [[ $SRS_NASM == YES ]]; then
+    echo -e "${GREEN}NASM for HTTPS(openssl) and FFmepg is enabled${BLACK}"
+else
+    echo -e "${YELLOW}Warning: NASM for HTTPS(openssl) and FFmepg is disabled${BLACK}"
+fi
+if [[ $SRS_SRTP_ASM == YES ]]; then
+    echo -e "${GREEN}SRTP-NASM for WebRTC(openssl) is enabled${BLACK}"
+else
+    echo -e "${YELLOW}Warning: SRTP-NASM for WebRTC(openssl) is disabled${BLACK}"
+fi
+if [ $SRS_TRANSCODE = YES ]; then
+    echo -e "${GREEN}The transcoding is enabled${BLACK}"
+else
+    echo -e "${YELLOW}Warning: The transcoding is disabled.${BLACK}"
+fi
+if [ $SRS_INGEST = YES ]; then
+    echo -e "${GREEN}The ingesting is enabled.${BLACK}"
+else
+    echo -e "${YELLOW}Warning: The ingesting is disabled.${BLACK}"
+fi
+if [ $SRS_HTTP_CALLBACK = YES ]; then
+    echo -e "${GREEN}The http-callback is enabled${BLACK}"
+else
+    echo -e "${YELLOW}Warning: The http-callback is disabled.${BLACK}"
+fi
+if [ $SRS_HTTP_SERVER = YES ]; then
+    echo -e "${GREEN}Embeded HTTP server for HTTP-FLV/HLS is enabled.${BLACK}"
+else
+    echo -e "${YELLOW}Warning: Embeded HTTP server is disabled, HTTP-FLV is disabled, please use nginx to delivery HLS.${BLACK}"
+fi
+if [ $SRS_HTTP_API = YES ]; then
+    echo -e "${GREEN}The HTTP API is enabled${BLACK}"
+else
+    echo -e "${YELLOW}Warning: The HTTP API is disabled.${BLACK}"
+fi
+if [ $SRS_UTEST = YES ]; then
+    echo -e "${GREEN}The utests are enabled.${BLACK}"
+else
+    echo -e "${YELLOW}Note: The utests are disabled.${BLACK}"
+fi
+if [ $SRS_GPERF = YES ]; then
+    echo -e "${GREEN}The gperf(tcmalloc) is enabled.${BLACK}"
+else
+    echo -e "${GREEN}Note: The gperf(tcmalloc) is disabled.${BLACK}"
+fi
+if [ $SRS_GPERF_MC = YES ]; then
+    echo -e "${YELLOW}The gmc(gperf memory check) is enabled, performance may suffer.${BLACK}"
+else
+    echo -e "${GREEN}Note: The gmc(gperf memory check) is disabled.${BLACK}"
+fi
+if [ $SRS_GPERF_MD = YES ]; then
+    echo -e "${YELLOW}The gmd(gperf memory defense) is enabled, performance may suffer.${BLACK}"
+else
+    echo -e "${GREEN}Note: The gmd(gperf memory defense) is disabled.${BLACK}"
+fi
+if [ $SRS_GPERF_MP = YES ]; then
+    echo -e "${YELLOW}The gmp(gperf memory profile) is enabled, performance may suffer.${BLACK}"
+else
+    echo -e "${GREEN}Note: The gmp(gperf memory profile) is disabled.${BLACK}"
+fi
+if [ $SRS_GPERF_CP = YES ]; then
+    echo -e "${YELLOW}The gcp(gperf cpu profile) is enabled, performance may suffer.${BLACK}"
+else
+    echo -e "${GREEN}Note: The gcp(gperf cpu profile) is disabled.${BLACK}"
+fi
+if [ $SRS_GPROF = YES ]; then
+    echo -e "${YELLOW}The gprof(GNU profile tool) is enabled, performance may suffer.${BLACK}"
+else
+    echo -e "${GREEN}Note: The gprof(GNU profile tool) is disabled.${BLACK}"
+fi
+if [ $SRS_CROSS_BUILD = YES ]; then
+    echo -e "${YELLOW}The cross-build is enabled.${BLACK}"
+else
+    echo -e "${GREEN}Note: The cross-build is disabled.${BLACK}"
+fi
+if [ $SRS_VALGRIND = YES ]; then
+    echo -e "${GREEN}The valgrind is enabled.${BLACK}"
+else
+    echo -e "${GREEN}Note: The valgrind is disabled.${BLACK}"
+fi
+# add each modules for application
+for SRS_MODULE in ${SRS_MODULES[*]}; do
+    echo -e "${GREEN}Enable module: $SRS_MODULE${BLACK}"
+done
+
+#####################################################################################
+# Do cleanup when configure done.
+#####################################################################################
+if [[ $SRS_CLEAN == YES && -f Makefile ]]; then
+    #echo "Do full cleanup, you can disable it by: --clean=off"
+    make clean
+fi
+
+#####################################################################################
+# next step
+#####################################################################################
+if [[ $SRS_CHERRYPY == YES ]]; then
+  echo ""
+  echo "You can run 3rdparty applications:"
+  if [ $SRS_HTTP_CALLBACK = YES ]; then
+      echo -e "\" python ./research/api-server/server.py 8085  \" to start the api-server"
+  fi
+fi
+echo ""
+echo "You can build SRS:"
+echo "\" make \" to build the SRS server"
+echo "\" make help \" to get some help"
+
